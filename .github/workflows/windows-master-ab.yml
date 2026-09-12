@@ -1,0 +1,15 @@
+name: Windows master A/B
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    uses: ./.github/workflows/ci-windows.yml
+    with:
+      publish_release: 'false'
+      release_commit: '0f7dcf3dc20b2dfee0912e07f422f812a42d1621'
+      release_version: '2026.912.120000'
