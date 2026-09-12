@@ -3,6 +3,7 @@
  * @brief Miscellaneous definitions for Windows.
  */
 // standard includes
+#include <atomic>
 #include <csignal>
 #include <filesystem>
 #include <iomanip>
@@ -137,6 +138,10 @@ namespace platf {
   decltype(QOSRemoveSocketFromFlow) *fn_QOSRemoveSocketFromFlow = nullptr;  ///< Fn QoS remove socket from flow.
 
   HANDLE wlan_handle = nullptr;  ///< Wlan handle.
+
+  // Once source-address control messages are rejected with WSAEINVAL, avoid
+  // retrying them for every packet during the lifetime of this process.
+  std::atomic<bool> source_pinning_supported {true};  ///< Tracks whether IP_PKTINFO source pinning is usable.
 
   decltype(WlanOpenHandle) *fn_WlanOpenHandle = nullptr;  ///< Fn wlan open handle.
   decltype(WlanCloseHandle) *fn_WlanCloseHandle = nullptr;  ///< Fn wlan close handle.
@@ -1437,6 +1442,12 @@ namespace platf {
   // Use UDP segmentation offload if it is supported by the OS. If the NIC is capable, this will use
   // hardware acceleration to reduce CPU usage. Support for USO was introduced in Windows 10 20H1.
   bool send_batch(batched_send_info_t &send_info) {
+    // The unbatched path will send without IP_PKTINFO after the local Winsock
+    // provider rejects source pinning. Do not retry USO for every video batch.
+    if (!source_pinning_supported.load(std::memory_order_relaxed)) {
+      return false;
+    }
+
     WSAMSG msg;
 
     // Convert the target address into a SOCKADDR
@@ -1573,41 +1584,38 @@ namespace platf {
     msg.dwFlags = 0;
 
     char cmbuf[std::max(WSA_CMSG_SPACE(sizeof(IN6_PKTINFO)), WSA_CMSG_SPACE(sizeof(IN_PKTINFO)))] = {};
-    ULONG cmbuflen = 0;
+    if (source_pinning_supported.load(std::memory_order_relaxed)) {
+      msg.Control.buf = cmbuf;
+      msg.Control.len = sizeof(cmbuf);
 
-    msg.Control.buf = cmbuf;
-    msg.Control.len = sizeof(cmbuf);
+      auto cm = WSA_CMSG_FIRSTHDR(&msg);
+      if (send_info.source_address.is_v6()) {
+        IN6_PKTINFO pktInfo;
 
-    auto cm = WSA_CMSG_FIRSTHDR(&msg);
-    if (send_info.source_address.is_v6()) {
-      IN6_PKTINFO pktInfo;
+        SOCKADDR_IN6 saddr_v6 = to_sockaddr(send_info.source_address.to_v6(), 0);
+        pktInfo.ipi6_addr = saddr_v6.sin6_addr;
+        pktInfo.ipi6_ifindex = 0;
 
-      SOCKADDR_IN6 saddr_v6 = to_sockaddr(send_info.source_address.to_v6(), 0);
-      pktInfo.ipi6_addr = saddr_v6.sin6_addr;
-      pktInfo.ipi6_ifindex = 0;
+        cm->cmsg_level = IPPROTO_IPV6;
+        cm->cmsg_type = IPV6_PKTINFO;
+        cm->cmsg_len = WSA_CMSG_LEN(sizeof(pktInfo));
+        memcpy(WSA_CMSG_DATA(cm), &pktInfo, sizeof(pktInfo));
+      } else {
+        IN_PKTINFO pktInfo;
 
-      cmbuflen += WSA_CMSG_SPACE(sizeof(pktInfo));
+        SOCKADDR_IN saddr_v4 = to_sockaddr(send_info.source_address.to_v4(), 0);
+        pktInfo.ipi_addr = saddr_v4.sin_addr;
+        pktInfo.ipi_ifindex = 0;
 
-      cm->cmsg_level = IPPROTO_IPV6;
-      cm->cmsg_type = IPV6_PKTINFO;
-      cm->cmsg_len = WSA_CMSG_LEN(sizeof(pktInfo));
-      memcpy(WSA_CMSG_DATA(cm), &pktInfo, sizeof(pktInfo));
+        cm->cmsg_level = IPPROTO_IP;
+        cm->cmsg_type = IP_PKTINFO;
+        cm->cmsg_len = WSA_CMSG_LEN(sizeof(pktInfo));
+        memcpy(WSA_CMSG_DATA(cm), &pktInfo, sizeof(pktInfo));
+      }
     } else {
-      IN_PKTINFO pktInfo;
-
-      SOCKADDR_IN saddr_v4 = to_sockaddr(send_info.source_address.to_v4(), 0);
-      pktInfo.ipi_addr = saddr_v4.sin_addr;
-      pktInfo.ipi_ifindex = 0;
-
-      cmbuflen += WSA_CMSG_SPACE(sizeof(pktInfo));
-
-      cm->cmsg_level = IPPROTO_IP;
-      cm->cmsg_type = IP_PKTINFO;
-      cm->cmsg_len = WSA_CMSG_LEN(sizeof(pktInfo));
-      memcpy(WSA_CMSG_DATA(cm), &pktInfo, sizeof(pktInfo));
+      msg.Control.buf = nullptr;
+      msg.Control.len = 0;
     }
-
-    msg.Control.len = cmbuflen;
 
     DWORD bytes_sent;
     if (WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) != SOCKET_ERROR) {
@@ -1616,12 +1624,15 @@ namespace platf {
 
     auto winerr = WSAGetLastError();
     if (winerr == WSAEINVAL) {
+      auto const disabled_source_pinning = source_pinning_supported.exchange(false, std::memory_order_relaxed);
       // Some routed paths reject a source address forced with IP_PKTINFO. Retry
-      // without ancillary data and let Windows select the source address.
+      // once without ancillary data, then use that path for this process.
       msg.Control.buf = nullptr;
       msg.Control.len = 0;
       if (WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) != SOCKET_ERROR) {
-        BOOST_LOG(warning) << "WSASendMsg() rejected IP_PKTINFO with WSAEINVAL; retried without source pinning"sv;
+        if (disabled_source_pinning) {
+          BOOST_LOG(warning) << "WSASendMsg() rejected IP_PKTINFO with WSAEINVAL; disabling source pinning"sv;
+        }
         return true;
       }
       winerr = WSAGetLastError();
