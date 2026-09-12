@@ -1610,13 +1610,25 @@ namespace platf {
     msg.Control.len = cmbuflen;
 
     DWORD bytes_sent;
-    if (WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) == SOCKET_ERROR) {
-      auto winerr = WSAGetLastError();
-      BOOST_LOG(warning) << "WSASendMsg() failed: "sv << winerr;
-      return false;
+    if (WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) != SOCKET_ERROR) {
+      return true;
     }
 
-    return true;
+    auto winerr = WSAGetLastError();
+    if (winerr == WSAEINVAL) {
+      // Some routed paths reject a source address forced with IP_PKTINFO. Retry
+      // without ancillary data and let Windows select the source address.
+      msg.Control.buf = nullptr;
+      msg.Control.len = 0;
+      if (WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) != SOCKET_ERROR) {
+        BOOST_LOG(warning) << "WSASendMsg() rejected IP_PKTINFO with WSAEINVAL; retried without source pinning"sv;
+        return true;
+      }
+      winerr = WSAGetLastError();
+    }
+
+    BOOST_LOG(warning) << "WSASendMsg() failed: "sv << winerr;
+    return false;
   }
 
   /**
